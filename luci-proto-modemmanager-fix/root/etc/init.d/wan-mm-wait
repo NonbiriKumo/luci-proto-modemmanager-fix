@@ -1,0 +1,95 @@
+#!/bin/sh /etc/rc.common
+# 开机自动拨号 + 掉线自动恢复（配合 netifd 的 modemmanager 协议）。
+#
+# 需要本看护的三个原因：
+#
+#  1. network(S20) 早于 modemmanager(S70) 启动，而协议处理器查不到模组就立即失败
+#     （DEVICE_NOT_MANAGED）并把接口置为 unavailable，此后没有重试机制；
+#  2. proto modemmanager 的接口在承载断开后会被整个拆掉。ModemManager 的
+#     /usr/lib/ModemManager/connection.d/10-report-down 只在 "bearer disconnected"
+#     事件里做 down+up 配对重连；若是手动 ifdown、配置重载或连接失败，就再没有
+#     任何东西把它拉回来；
+#  3. 连接失败时处理器默认执行 proto_block_restart（明确阻止自动重启）。
+#
+# 本服务循环看护 UCI 里 proto=modemmanager 且 auto=1 的接口：只要它不在 up
+# （也不在 pending）状态，就等 ModemManager 发布模组后把它拉起来。
+#
+# 不想被看护时：把该接口的 option auto 设为 0，或 /etc/init.d/wan-mm-wait stop。
+
+START=95
+
+WATCH_INTERVAL=30
+PIDFILE=/var/run/wan-mm-wait.pid
+
+# 等 ModemManager 发布模组，成功则输出它的对象路径
+wait_for_modem() {
+local i modem
+
+for i in $(seq 1 90); do
+modem=$(mmcli -L 2>/dev/null | \
+grep -o '/org/freedesktop/ModemManager1/Modem/[0-9]*' | head -n 1)
+if [ -n "$modem" ]; then
+printf '%s\n' "$modem"
+return 0
+fi
+sleep 2
+done
+
+return 1
+}
+
+# 配置里的模组路径失效时（ModemManager 的对象编号不固定）修正它
+fix_stale_device() {
+local section="$1" device="$2" modem="$3" count
+
+[ -n "$device" ] || return 0
+mmcli -m "$device" -J >/dev/null 2>&1 && return 0
+
+count=$(mmcli -L 2>/dev/null | \
+grep -c '/org/freedesktop/ModemManager1/Modem/')
+if [ -n "$modem" ] && [ "$count" -eq 1 ]; then
+uci set "network.$section.device=$modem"
+uci commit network
+logger -t wan-mm-wait "modem path $device -> $modem"
+fi
+}
+
+watch_loop() {
+local modem section device status
+
+while :; do
+modem=$(wait_for_modem)
+
+for section in $(uci show network 2>/dev/null | \
+ sed -n "s/^network\.\([^.=]*\)\.proto='modemmanager'$/\1/p"); do
+# 只有显式 auto=0 才不管（LuCI 保存接口时可能会把 auto 选项去掉，
+# 缺省按“要自动连接”处理，否则掉线后就没人恢复了）
+[ "$(uci -q get "network.$section.auto")" = "0" ] && continue
+
+status=$(ubus call network.interface."$section" status 2>/dev/null)
+case "$status" in
+*'"up": true'*) continue ;;       # 已经连着
+*'"pending": true'*) continue ;;  # 正在建立，别插队
+esac
+
+device=$(uci -q get "network.$section.device")
+[ -n "$modem" ] && fix_stale_device "$section" "$device" "$modem"
+[ -n "$modem" ] && mmcli -m "$modem" --enable >/dev/null 2>&1
+
+logger -t wan-mm-wait "bringing up $section"
+ifup "$section" >/dev/null 2>&1
+done
+
+sleep "$WATCH_INTERVAL"
+done
+}
+
+start() {
+watch_loop &
+echo $! > "$PIDFILE"
+}
+
+stop() {
+[ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null
+rm -f "$PIDFILE"
+}

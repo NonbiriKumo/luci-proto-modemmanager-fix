@@ -1,0 +1,360 @@
+diff --git a/src/plugins/quectel/mm-modem-helpers-quectel.c b/src/plugins/quectel/mm-modem-helpers-quectel.c
+index 126642e..08449a1 100644
+--- a/src/plugins/quectel/mm-modem-helpers-quectel.c
++++ b/src/plugins/quectel/mm-modem-helpers-quectel.c
+@@ -204,3 +204,96 @@ mm_quectel_is_profile_manager_supported (const gchar *revision,
+ 
+     return TRUE;
+ }
++
++/*****************************************************************************/
++/* +QENG="servingcell"                                                       */
++/*                                                                           */
++/* 部分移远模组（如 RM500U-CNV）不响应 +CREG/+CEREG，ModemManager 因此拿不到  */
++/* 3GPP 小区位置；数据只能通过私有命令 +QENG="servingcell" 获得，格式为：      */
++/*                                                                           */
++/*   LTE:      "servingcell",<state>,"LTE",<is_tdd>,<MCC>,<MNC>,<cellID>,     */
++/*             <PCID>,<earfcn>,<freq_band_ind>,<UL_bw>,<DL_bw>,<TAC>,...      */
++/*   NR5G-SA:  "servingcell",<state>,"NR5G-SA",<duplex>,<MCC>,<MNC>,<cellID>, */
++/*             <PCID>,<TAC>,<ARFCN>,<band>,<bw>,...                           */
++/*   WCDMA/GSM:"servingcell",<state>,"WCDMA",<MCC>,<MNC>,<LAC>,<cellID>,...   */
++/*                                                                           */
++/* MCC/MNC/CID/PCID 在 LTE 与 NR5G 中位置一致，TAC 位置不同；LAC 类制式则整体 */
++/* 前移一位。LTE/NR5G 的 cellID 与 TAC 是十六进制。                            */
++/*****************************************************************************/
++
++gboolean
++mm_quectel_parse_qeng_servingcell (const gchar  *response,
++                                   guint        *mcc,
++                                   guint        *mnc,
++                                   gulong       *lac,
++                                   gulong       *tac,
++                                   gulong       *cell_id,
++                                   GError      **error)
++{
++    g_auto(GStrv)     split = NULL;
++    g_autofree gchar *act = NULL;
++    const gchar      *p;
++    guint             n;
++    gint              idx_mcc = -1;
++    gint              idx_mnc = -1;
++    gint              idx_ci  = -1;
++    gint              idx_tac = -1;
++    gint              idx_lac = -1;
++
++    g_return_val_if_fail (response != NULL, FALSE);
++    g_return_val_if_fail (error == NULL || *error == NULL, FALSE);
++
++    p = mm_strip_tag (response, "+QENG:");
++    if (!p || !p[0]) {
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                     "missing +QENG response");
++        return FALSE;
++    }
++
++    /* 字段内不含逗号，去掉引号后直接按逗号切分 */
++    split = g_strsplit (p, ",", -1);
++    for (n = 0; split[n]; n++)
++        mm_strip_quotes (split[n]);
++
++    if (n < 4 || g_strcmp0 (split[0], "servingcell") != 0) {
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                     "not a +QENG servingcell response: '%s'", response);
++        return FALSE;
++    }
++
++    act = g_ascii_strup (split[2], -1);
++
++    if (g_strstr_len (act, -1, "LTE")) {
++        idx_mcc = 4; idx_mnc = 5; idx_ci = 6; idx_tac = 12;
++    } else if (g_strstr_len (act, -1, "NR5G")) {
++        idx_mcc = 4; idx_mnc = 5; idx_ci = 6; idx_tac = 8;
++    } else if (g_strstr_len (act, -1, "WCDMA") ||
++               g_strstr_len (act, -1, "UMTS") ||
++               g_strstr_len (act, -1, "GSM") ||
++               g_strstr_len (act, -1, "TDSCDMA")) {
++        idx_mcc = 3; idx_mnc = 4; idx_lac = 5; idx_ci = 6;
++    } else {
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                     "unsupported access technology in +QENG response: '%s'", act);
++        return FALSE;
++    }
++
++    if ((guint) idx_mcc >= n || (guint) idx_mnc >= n || (guint) idx_ci >= n) {
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                     "truncated +QENG %s response: '%s'", act, response);
++        return FALSE;
++    }
++
++    if (mcc)
++        *mcc = (guint) g_ascii_strtoull (split[idx_mcc], NULL, 10);
++    if (mnc)
++        *mnc = (guint) g_ascii_strtoull (split[idx_mnc], NULL, 10);
++    if (cell_id)
++        *cell_id = (gulong) g_ascii_strtoull (split[idx_ci], NULL, 16);
++    if (tac && idx_tac >= 0 && (guint) idx_tac < n)
++        *tac = (gulong) g_ascii_strtoull (split[idx_tac], NULL, 16);
++    if (lac && idx_lac >= 0 && (guint) idx_lac < n)
++        *lac = (gulong) g_ascii_strtoull (split[idx_lac], NULL, 16);
++
++    return TRUE;
++}
+diff --git a/src/plugins/quectel/mm-modem-helpers-quectel.h b/src/plugins/quectel/mm-modem-helpers-quectel.h
+index e4bc63b..9356aed 100644
+--- a/src/plugins/quectel/mm-modem-helpers-quectel.h
++++ b/src/plugins/quectel/mm-modem-helpers-quectel.h
+@@ -30,6 +30,13 @@ gboolean mm_quectel_parse_ctzu_test_response (const gchar  *response,
+                                               GError      **error);
+ 
+ gboolean mm_quectel_check_standard_firmware_version_valid (const gchar *std_str);
++gboolean mm_quectel_parse_qeng_servingcell (const gchar  *response,
++                                            guint        *mcc,
++                                            guint        *mnc,
++                                            gulong       *lac,
++                                            gulong       *tac,
++                                            gulong       *cell_id,
++                                            GError      **error);
+ 
+ gboolean mm_quectel_get_version_from_revision (const gchar  *revision,
+                                                guint        *release,
+diff --git a/src/plugins/quectel/mm-shared-quectel.c b/src/plugins/quectel/mm-shared-quectel.c
+index 1bae73e..d0be6ac 100644
+--- a/src/plugins/quectel/mm-shared-quectel.c
++++ b/src/plugins/quectel/mm-shared-quectel.c
+@@ -57,6 +57,7 @@ typedef struct {
+     MMIfaceModemFirmwareInterface *iface_modem_firmware_parent;
+     MMModemLocationSource          provided_sources;
+     MMModemLocationSource          enabled_sources;
++    guint                          qeng_poll_id;
+     FeatureSupport                 qgps_supported;
+     GRegex                        *dtmf_regex;
+     GRegex                        *qgpsurc_regex;
+@@ -67,6 +68,8 @@ typedef struct {
+ static void
+ private_free (Private *priv)
+ {
++    if (priv->qeng_poll_id)
++        g_source_remove (priv->qeng_poll_id);
+     g_regex_unref (priv->dtmf_regex);
+     g_regex_unref (priv->qgpsurc_regex);
+     g_regex_unref (priv->qlwurc_regex);
+@@ -811,6 +814,167 @@ mm_shared_quectel_location_load_capabilities (MMIfaceModemLocation *_self,
+ }
+ 
+ /*****************************************************************************/
++/*****************************************************************************/
++/* 3GPP cell location via +QENG="servingcell"                                */
++/*                                                                           */
++/* ModemManager 取 3GPP 小区位置靠的是 +CREG/+CEREG 的注册上报，而部分移远     */
++/* 模组（例如 RM500U-CNV）对这两条命令不返回任何内容，位置因此始终为空。数据    */
++/* 其实存在，但只通过私有命令 +QENG="servingcell" 暴露。                       */
++/*                                                                           */
++/* 这里在启用 3GPP 位置源时主动采集一次（让位置马上有值），并每 30 秒刷新，把   */
++/* 结果喂给 location 接口；关闭该位置源时停止刷新。                            */
++/*****************************************************************************/
++
++#define QENG_SERVINGCELL_FIRST_DELAY_SECS 2
++#define QENG_SERVINGCELL_POLL_SECS        30
++
++static void
++qeng_servingcell_update (MMBaseModem *modem,
++                         const gchar *response)
++{
++    GError *error = NULL;
++    guint   mcc = 0;
++    guint   mnc = 0;
++    gulong  lac = 0;
++    gulong  tac = 0;
++    gulong  cell_id = 0;
++    gchar  *operator_code;
++
++    if (!mm_quectel_parse_qeng_servingcell (response, &mcc, &mnc, &lac, &tac, &cell_id, &error)) {
++        mm_obj_dbg (modem, "couldn't parse +QENG servingcell response: %s", error->message);
++        g_error_free (error);
++        return;
++    }
++
++    if (mcc && mnc) {
++        operator_code = g_strdup_printf ("%u%02u", mcc, mnc);
++        mm_obj_dbg (modem, "3GPP location operator code from +QENG: '%s'", operator_code);
++        mm_iface_modem_location_3gpp_update_operator_code (MM_IFACE_MODEM_LOCATION (modem), operator_code);
++        g_free (operator_code);
++    }
++
++    if (lac || tac || cell_id) {
++        mm_obj_dbg (modem, "3GPP location from +QENG: lac %lu, tac %lu, cell id %lu", lac, tac, cell_id);
++        mm_iface_modem_location_3gpp_update_lac_tac_ci (MM_IFACE_MODEM_LOCATION (modem), lac, tac, cell_id);
++    }
++}
++
++static void
++qeng_servingcell_ready (MMBaseModem  *modem,
++                        GAsyncResult *res,
++                        gpointer      user_data)
++{
++    g_autofree gchar *response = NULL;
++    GError *error = NULL;
++
++    response = mm_base_modem_at_command_finish (modem, res, &error);
++    if (!response) {
++        mm_obj_dbg (modem, "+QENG=\"servingcell\" failed: %s", error->message);
++        g_error_free (error);
++        return;
++    }
++
++    qeng_servingcell_update (modem, response);
++}
++
++static void
++qeng_servingcell_run (MMBaseModem *modem)
++{
++    mm_base_modem_at_command (modem,
++                              "+QENG=\"servingcell\"",
++                              3,
++                              FALSE,
++                              (GAsyncReadyCallback)qeng_servingcell_ready,
++                              NULL);
++}
++
++static gboolean qeng_servingcell_ready_to_query (MMBaseModem *modem);
++
++static gboolean
++qeng_servingcell_poll_cb (gpointer user_data)
++{
++    MMBaseModem *modem = MM_BASE_MODEM (user_data);
++
++    /* 模组被停用/重新初始化期间跳过本轮 */
++    if (qeng_servingcell_ready_to_query (modem))
++        qeng_servingcell_run (modem);
++    return G_SOURCE_CONTINUE;
++}
++
++/* 模组是否已经过了初始化阶段、进入注册状态。
++ *
++ * 注意闸门必须放在 REGISTERED 而不是 ENABLED：在 enable（端口打开/关闭）过程中
++ * 向 AT 口下发命令，会让 ModemManager 在释放 AT 上下文时崩溃
++ * （backtrace 落在 at_command_context_free）。等注册完成后再查询就避开了这个窗口。 */
++static gboolean
++qeng_servingcell_ready_to_query (MMBaseModem *modem)
++{
++    MMModemState state = MM_MODEM_STATE_UNKNOWN;
++
++    g_object_get (modem, MM_IFACE_MODEM_STATE, &state, NULL);
++    return (state >= MM_MODEM_STATE_REGISTERED);
++}
++
++static gboolean
++qeng_servingcell_first_cb (gpointer user_data)
++{
++    MMBaseModem *modem = MM_BASE_MODEM (user_data);
++    Private     *priv;
++
++    priv = get_private (MM_SHARED_QUECTEL (modem));
++
++    /* 模组还在初始化时不要发 AT 命令：此时 ModemManager 自己也在密集使用
++     * AT 口，并发的命令会让它在释放 AT 上下文时崩溃。等进入 ENABLED 再说。 */
++    if (!qeng_servingcell_ready_to_query (modem)) {
++        priv->qeng_poll_id = g_timeout_add_seconds_full (G_PRIORITY_DEFAULT,
++                                                         QENG_SERVINGCELL_FIRST_DELAY_SECS,
++                                                         qeng_servingcell_first_cb,
++                                                         g_object_ref (modem),
++                                                         g_object_unref);
++        return G_SOURCE_REMOVE;
++    }
++
++    /* 先采集一次，然后转入常规间隔刷新 */
++    qeng_servingcell_run (modem);
++    priv->qeng_poll_id = g_timeout_add_seconds_full (G_PRIORITY_DEFAULT,
++                                                     QENG_SERVINGCELL_POLL_SECS,
++                                                     qeng_servingcell_poll_cb,
++                                                     g_object_ref (modem),
++                                                     g_object_unref);
++    return G_SOURCE_REMOVE;
++}
++
++static void
++qeng_servingcell_poll_start (MMBaseModem *modem)
++{
++    Private *priv;
++
++    priv = get_private (MM_SHARED_QUECTEL (modem));
++    if (priv->qeng_poll_id)
++        return;
++
++    /* 注意：不能在 enable_location_gathering 的调用栈里立刻发 AT 并更新位置 ——
++     * 此时位置接口的自启用流程尚未结束，ModemManager 会在 AT 口关闭后崩溃。
++     * 因此先延迟一拍，再开始采集与周期刷新。 */
++    priv->qeng_poll_id = g_timeout_add_seconds_full (G_PRIORITY_DEFAULT,
++                                                     QENG_SERVINGCELL_FIRST_DELAY_SECS,
++                                                     qeng_servingcell_first_cb,
++                                                     g_object_ref (modem),
++                                                     g_object_unref);
++}
++
++static void
++qeng_servingcell_poll_stop (MMBaseModem *modem)
++{
++    Private *priv;
++
++    priv = get_private (MM_SHARED_QUECTEL (modem));
++    if (priv->qeng_poll_id) {
++        g_source_remove (priv->qeng_poll_id);
++        priv->qeng_poll_id = 0;
++    }
++}
++
+ /* Enable location gathering (Location interface) */
+ 
+ /* NOTES:
+@@ -886,14 +1050,24 @@ parent_enable_location_gathering_ready (MMIfaceModemLocation *self,
+                                         GAsyncResult         *res,
+                                         GTask                *task)
+ {
+-    GError  *error = NULL;
+-    Private *priv;
++    GError               *error = NULL;
++    Private              *priv;
++    MMModemLocationSource source;
+ 
+     priv = get_private (MM_SHARED_QUECTEL (self));
+-    if (!priv->iface_modem_location_parent->enable_location_gathering_finish (self, res, &error))
++    if (!priv->iface_modem_location_parent->enable_location_gathering_finish (self, res, &error)) {
+         g_task_return_error (task, error);
+-    else
+-        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++
++    /* 3GPP 小区位置不由父类提供（父类靠 +CREG/+CEREG，本系列模组不响应），
++     * 改用移远私有 +QENG="servingcell" 采集。 */
++    source = GPOINTER_TO_UINT (g_task_get_task_data (task));
++    if (source & MM_MODEM_LOCATION_SOURCE_3GPP_LAC_CI)
++        qeng_servingcell_poll_start (MM_BASE_MODEM (self));
++
++    g_task_return_boolean (task, TRUE);
+     g_object_unref (task);
+ }
+ 
+@@ -944,6 +1118,10 @@ mm_shared_quectel_enable_location_gathering (MMIfaceModemLocation  *self,
+         return;
+     }
+ 
++    /* 3GPP 小区位置改用私有 +QENG 采集 */
++    if (source & MM_MODEM_LOCATION_SOURCE_3GPP_LAC_CI)
++        qeng_servingcell_poll_start (MM_BASE_MODEM (self));
++
+     /* If the GPS is already running just return */
+     priv->enabled_sources |= source;
+     g_task_return_boolean (task, TRUE);
+@@ -1006,6 +1184,10 @@ mm_shared_quectel_disable_location_gathering (MMIfaceModemLocation  *self,
+     task = g_task_new (self, NULL, callback, user_data);
+     priv->enabled_sources &= ~source;
+ 
++    /* 3GPP 位置源关闭后停止 +QENG 轮询 */
++    if (!(priv->enabled_sources & MM_MODEM_LOCATION_SOURCE_3GPP_LAC_CI))
++        qeng_servingcell_poll_stop (MM_BASE_MODEM (self));
++
+     /* Pass handling to parent if we don't handle it */
+     if (!(source & priv->provided_sources)) {
+         /* The step to disable location gathering may not exist */

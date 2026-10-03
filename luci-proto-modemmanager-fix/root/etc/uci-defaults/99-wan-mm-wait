@@ -1,0 +1,34 @@
+#!/bin/sh
+# 首次启动时做三件事：
+#
+#  1) 修复 modemmanager 接口的拨号相关选项（移远模组实测踩到的两个坑）：
+#     - LuCI 的接口表单保存后会丢掉 option auto，netifd 便不再自动拉起该接口，
+#       掉线后就没人重拨了；
+#     - option force_connection 未设置时，连接失败会走 proto_block_restart
+#       （明确阻止自动重启）。
+#     缺哪个补哪个（不覆盖用户显式设置的值）。
+#  2) 启用看护脚本 wan-mm-wait：开机等 ModemManager 发布模组后拨号，
+#     并在掉线后自动恢复。
+#  3) 重启 rpcd 让本包扩展过的 ACL（-b / --signal-get）生效。
+
+fix_dial_options() {
+local section
+
+for section in $(uci show network 2>/dev/null | grep -F "proto='modemmanager'" | cut -d. -f2); do
+if [ -z "$(uci -q get "network.$section.auto")" ]; then
+uci set "network.$section.auto=1"
+logger -t luci-proto-modemmanager-fix "network.$section: 补上 auto=1"
+fi
+if [ -z "$(uci -q get "network.$section.force_connection")" ]; then
+uci set "network.$section.force_connection=1"
+logger -t luci-proto-modemmanager-fix "network.$section: 补上 force_connection=1"
+fi
+done
+
+uci commit network
+}
+
+fix_dial_options
+[ -x /etc/init.d/wan-mm-wait ] && /etc/init.d/wan-mm-wait enable
+/etc/init.d/rpcd restart >/dev/null 2>&1
+exit 0
