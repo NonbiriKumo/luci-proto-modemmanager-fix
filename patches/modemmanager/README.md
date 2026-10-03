@@ -142,3 +142,23 @@ cp /root/wrapper.orig /usr/sbin/ModemManager-wrapper
 - 补丁在 ModemManager **1.24.0** 原始源码上可干净应用（`git apply --check` 通过），
   并被 OpenWrt 构建系统自动应用、编译通过（x86_64 / musl / 25.12.5 SDK）。
 - 功能正确性见上面的真机日志；**当前因上述崩溃不可用于生产**。
+
+## 附：另一种拨号修复（modemmanager-wait-for-modem.patch）
+
+`modemmanager-wait-for-modem.patch` 是给上游 `modemmanager` 包打的补丁：它修改
+`files/lib/netifd/proto/modemmanager.sh`，在协议处理器里加入「等待 ModemManager
+发布模组」的循环（可用 `option mm_wait` 调整秒数），从根因上解决 network(S20) 早于
+modemmanager(S70) 导致的开机不拨号。
+
+它与本项目的看护脚本 `wan-mm-wait` 解决同一问题，两者**择一即可**：
+
+- 用看护脚本（本项目默认）：不动上游包，还能覆盖「掉线后无人重拨」的场景；
+- 用本补丁：只修开机时序，掉线恢复仍依赖 ModemManager 自身的 connection.d 回调。
+
+应用方式（构建期）：
+
+```sh
+cp patches/modemmanager/modemmanager-wait-for-modem.patch \
+   feeds/packages/net/modemmanager/patches/
+make package/modemmanager/clean && make package/modemmanager/compile
+```

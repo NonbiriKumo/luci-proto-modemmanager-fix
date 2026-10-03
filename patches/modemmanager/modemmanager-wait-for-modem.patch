@@ -1,0 +1,58 @@
+--- a/files/lib/netifd/proto/modemmanager.sh	2026-10-03 00:47:24.642969599 +0800
++++ b/files/lib/netifd/proto/modemmanager.sh	2026-10-03 00:47:24.646972682 +0800
+@@ -600,14 +600,47 @@
+ 	}
+ 
+ 	# validate that ModemManager is handling the modem at the sysfs path
+-	modemstatus=$(mmcli --modem="${device}" --output-keyvalue)
+-	modempath=$(modemmanager_get_field "${modemstatus}" "modem.dbus-path")
+-	[ -n "${modempath}" ] || {
+-		echo "Device not managed by ModemManager"
+-		proto_notify_error "${interface}" DEVICE_NOT_MANAGED
+-		proto_set_available "${interface}" 0
+-		return 1
+-	}
++	#
++	# Two things make the plain lookup below unreliable:
++	#
++	#  - network comes up before ModemManager on boot, so the daemon (and
++	#    even the system bus it lives on) may not exist yet. Failing
++	#    immediately marks the interface unavailable and nothing ever
++	#    retries it, so the modem only connects after a manual ifup.
++	#  - the ModemManager object index is not stable (the same modem can
++	#    be Modem/0 or Modem/1 depending on how many objects the daemon
++	#    created before), so a configured path may go stale.
++	#
++	# Wait for the daemon, and fall back to the only modem present when the
++	# configured path no longer matches. "mm_wait" (seconds, default 300)
++	# overrides the timeout.
++	mm_wait_count=0
++	mm_wait=$(uci_get network "$interface" mm_wait "300")
++	while :; do
++		modemstatus=$(mmcli --modem="${device}" --output-keyvalue 2>/dev/null)
++		modempath=$(modemmanager_get_field "${modemstatus}" "modem.dbus-path")
++		if [ -z "${modempath}" ]; then
++			modemlist=$(mmcli -L 2>/dev/null | \
++				grep -o "/org/freedesktop/ModemManager1/Modem/[0-9]*")
++			if [ -n "${modemlist}" ] && \
++			   [ "$(printf "%s\n" "${modemlist}" | wc -l)" -eq 1 ]; then
++				device="${modemlist}"
++				modemstatus=$(mmcli --modem="${device}" --output-keyvalue 2>/dev/null)
++				modempath=$(modemmanager_get_field "${modemstatus}" "modem.dbus-path")
++			fi
++		fi
++		[ -n "${modempath}" ] && break
++		mm_wait_count=$((mm_wait_count + 1))
++		if [ "${mm_wait_count}" -ge "${mm_wait}" ]; then
++			echo "Device not managed by ModemManager"
++			proto_notify_error "${interface}" DEVICE_NOT_MANAGED
++			proto_set_available "${interface}" 0
++			return 1
++		fi
++		[ $((mm_wait_count % 10)) -eq 0 ] &&
++			echo "waiting for ModemManager to manage the modem (${mm_wait_count}s)"
++		sleep 1
++	done
+ 	echo "modem available at ${modempath}"
+ 
+ 	modemmanager_check_pin_state "$device" "$interface" "${modemstatus}" "$pincode"
