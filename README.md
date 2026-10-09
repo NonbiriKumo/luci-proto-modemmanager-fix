@@ -1,6 +1,6 @@
 # luci-proto-modemmanager-fix
 
-用 QModem 信息页的呈现方式重做 **ModemManager 的 LuCI 蜂窝网络信息页**，并修复
+重做 **ModemManager 的 LuCI 蜂窝网络信息页**，并修复
 **移远模组的拨号问题**（开机自动拨号 + 掉线自动恢复）。以「编译期替换上游
 `luci-proto-modemmanager`」的方式提供，独立于 QModem 仓库。
 
